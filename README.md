@@ -49,7 +49,6 @@ Usage Example
 -------------
 
     var websocket:WebSocket = new WebSocket("wss://localhost:4321/foo?bing=baz", "*", "my-chat-protocol");
-    websocket.enableDeflateStream = true;
     websocket.addEventListener(WebSocketEvent.CLOSED, handleWebSocketClosed);
     websocket.addEventListener(WebSocketEvent.OPEN, handleWebSocketOpen);
     websocket.addEventListener(WebSocketEvent.MESSAGE, handleWebSocketMessage);

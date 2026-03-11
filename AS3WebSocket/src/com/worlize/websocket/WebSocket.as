@@ -21,7 +21,9 @@ package com.worlize.websocket
 	import com.adobe.utils.StringUtil;
 	import com.hurlant.crypto.hash.SHA1;
 	import com.hurlant.crypto.tls.TLSConfig;
+	import com.hurlant.crypto.tls.CipherSuites;
 	import com.hurlant.crypto.tls.TLSEngine;
+	import com.hurlant.crypto.tls.TLSEvent;
 	import com.hurlant.crypto.tls.TLSSecurityParameters;
 	import com.hurlant.crypto.tls.TLSSocket;
 	import com.hurlant.util.Base64;
@@ -154,9 +156,15 @@ package com.worlize.websocket
 				tlsConfig = new TLSConfig(TLSEngine.CLIENT,
 										  null, null, null, null, null,
 										  TLSSecurityParameters.PROTOCOL_VERSION);
+				tlsConfig.cipherSuites = [
+					CipherSuites.TLS_RSA_WITH_AES_256_CBC_SHA,
+					CipherSuites.TLS_RSA_WITH_AES_128_CBC_SHA,
+					CipherSuites.TLS_RSA_WITH_3DES_EDE_CBC_SHA
+				];
 				tlsConfig.trustAllCertificates = true;
 				tlsConfig.ignoreCommonNameMismatch = true;
 				socket = tlsSocket = new TLSSocket();
+				tlsSocket.addEventListener(TLSEvent.READY, handleTLSReady);
 			}
 			
 			
@@ -193,15 +201,15 @@ package com.worlize.websocket
 		}
 		
 		public function connect():void {
+			logger("[WS] connect() readyState=" + _readyState);
 			if (_readyState === WebSocketState.INIT || _readyState === WebSocketState.CLOSED) {
 				_readyState = WebSocketState.CONNECTING;
 				generateNonce();
 				handshakeBytesReceived = 0;
 				
+				logger("[WS] rawSocket.connect(" + _host + ", " + _port + ")");
 				rawSocket.connect(_host, _port);
-				if (debug) {
-					logger("Connecting to " + _host + " on port " + _port);
-				}
+				logger("[WS] rawSocket.connect() returned");
 			}
 		}
 		
@@ -407,6 +415,8 @@ package com.worlize.websocket
 					socket.close();
 				}
 				catch(e:Error) { /* do nothing */ }
+				dispatchClosedEvent();
+				return;
 			}
 			if (socket.connected) {
 				var frame:WebSocketFrame = new WebSocketFrame();
@@ -440,27 +450,29 @@ package com.worlize.websocket
 		}
 		
 		private function handleSocketConnect(event:Event):void {
-			if (debug) {
-				logger("Socket Connected");
-			}
+			logger("[WS] handleSocketConnect!");
 			if (secure) {
-				if (debug) {
-					logger("starting SSL/TLS");
-				}
+				logger("[WS] starting SSL/TLS");
 				tlsSocket.startTLS(rawSocket, _host, tlsConfig);
+				return;
 			}
+			socket.endian = Endian.BIG_ENDIAN;
+			sendHandshake();
+		}
+
+		private function handleTLSReady(event:TLSEvent):void {
+			logger("[WS] TLS ready");
 			socket.endian = Endian.BIG_ENDIAN;
 			sendHandshake();
 		}
 		
 		private function handleSocketClose(event:Event):void {
-			if (debug) {
-				logger("Socket Disconnected");
-			}
+			logger("[WS] handleSocketClose!");
 			dispatchClosedEvent();
 		}
 		
 		private function handleSocketData(event:ProgressEvent=null):void {
+			logger("[WS] handleSocketData avail=" + socket.bytesAvailable + " state=" + _readyState);
 			if (_readyState === WebSocketState.CONNECTING) {
 				readServerHandshake();
 				return;
@@ -469,6 +481,7 @@ package com.worlize.websocket
 			// addData returns true if the frame is complete, and false
 			// if more data is needed.
 			while (socket.connected && currentFrame.addData(socket, fragmentationOpcode, config) && !fatalError) {
+				logger("[WS] frame complete: opcode=" + currentFrame.opcode + " fin=" + currentFrame.fin + " len=" + currentFrame.length + " err=" + currentFrame.protocolError + " big=" + currentFrame.frameTooLarge);
 				if (currentFrame.protocolError) {
 					drop(WebSocketCloseStatus.PROTOCOL_ERROR, currentFrame.dropReason);
 					return;
@@ -488,6 +501,7 @@ package com.worlize.websocket
 		}
 		
 		private function processFrame(frame:WebSocketFrame):void {
+			logger("[WS] processFrame opcode=" + frame.opcode + " fin=" + frame.fin + " len=" + frame.length);
 			var event:WebSocketEvent;
 			var i:int;
 			var currentFrame:WebSocketFrame;
@@ -526,10 +540,12 @@ package com.worlize.websocket
 					if (config.assembleFragments) {
 						if (frameQueue.length === 0) {
 							if (frame.fin) {
+								var textData:String = frame.binaryPayload.readMultiByte(frame.length, 'utf-8');
+								logger("[WS] TEXT msg (" + textData.length + " chars): " + textData.substr(0, 80));
 								event = new WebSocketEvent(WebSocketEvent.MESSAGE);
 								event.message = new WebSocketMessage();
 								event.message.type = WebSocketMessage.TYPE_UTF8;
-								event.message.utf8Data = frame.binaryPayload.readMultiByte(frame.length, 'utf-8');
+								event.message.utf8Data = textData;
 								dispatchEvent(event);
 							}
 							else {
@@ -663,22 +679,19 @@ package com.worlize.websocket
 		}
 		
 		private function handleSocketIOError(event:IOErrorEvent):void {
-			if (debug) {
-				logger("IO Error: " + event);
-			}
+			logger("[WS] IO_ERROR: " + event.text);
 			dispatchEvent(event);
 			dispatchClosedEvent();
 		}
 		
 		private function handleSocketSecurityError(event:SecurityErrorEvent):void {
-			if (debug) {
-				logger("Security Error: " + event);
-			}
+			logger("[WS] SECURITY_ERROR: " + event.text);
 			dispatchEvent(event.clone());
 			dispatchClosedEvent();
 		}
 		
 		private function sendHandshake():void {
+			logger("[WS] sendHandshake()");
 			serverHandshakeResponse = "";
 			
 			var hostValue:String = host;
@@ -696,6 +709,7 @@ package com.worlize.websocket
 				text += "Origin: " + _origin + "\r\n";
 			}
 			text += "Sec-WebSocket-Version: 13\r\n";
+			text += "User-Agent: Mozilla/5.0\r\n";
 			if (_protocols) {
 				var protosList:String = _protocols.join(", ");
 				text += "Sec-WebSocket-Protocol: " + protosList + "\r\n";
@@ -703,11 +717,11 @@ package com.worlize.websocket
 			// TODO: Handle Extensions
 			text += "\r\n";
 			
-			if (debug) {
-				logger(text);
-			}
+			logger("[WS] Sending HTTP upgrade: " + text.substr(0, 120));
 			
 			socket.writeMultiByte(text, 'us-ascii');
+			socket.flush();
+			logger("[WS] Handshake flushed");
 			
 			handshakeTimer.stop();
 			handshakeTimer.reset();
@@ -784,6 +798,7 @@ package com.worlize.websocket
 		}
 		
 		private function readServerHandshake():void {
+			logger("[WS] readServerHandshake()");
 			var upgradeHeader:Boolean = false;
 			var connectionHeader:Boolean = false;
 			var serverProtocolHeaderMatch:Boolean = false;
@@ -838,6 +853,7 @@ package com.worlize.websocket
 				while (lines.length > 0) {
 					responseLine = lines.shift();
 					var header:Object = parseHTTPHeader(responseLine);
+					if (header == null) continue; // skip malformed header lines
 					var lcName:String = header.name.toLocaleLowerCase();
 					var lcValue:String = header.value.toLocaleLowerCase();
 					if (lcName === 'upgrade' && lcValue === 'websocket') {
@@ -918,15 +934,17 @@ package com.worlize.websocket
 		}
 		
 		private function handleHandshakeTimer(event:TimerEvent):void {
+			logger("[WS] HANDSHAKE TIMEOUT!");
 			failHandshake("Timed out waiting for server response.");
 		}
 		
 		private function parseHTTPHeader(line:String):Object {
-			var header:Array = line.split(/\: +/);
-			return header.length === 2 ? {
-				name: header[0],
-				value: header[1]
-			} : null;
+			var colonIndex:int = line.indexOf(":");
+			if (colonIndex <= 0) return null;
+			return {
+				name: StringUtil.trim(line.substring(0, colonIndex)),
+				value: StringUtil.trim(line.substring(colonIndex + 1))
+			};
 		}
 		
 		// Return true if the header is completely read

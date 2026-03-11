@@ -104,6 +104,9 @@ package com.hurlant.crypto.tls {
 		private function onTLSReady(event:TLSEvent):void {
 			_ready = true;
 			scheduleWrite();
+			// Dispatch a fresh TLSEvent so the native Socket base class doesn't
+			// strip the subclass type before delivering it to external listeners.
+			dispatchEvent(new TLSEvent(TLSEvent.READY));
 		}
 		
 		private function onTLSClose(event:Event):void {
@@ -179,6 +182,15 @@ package com.hurlant.crypto.tls {
 			
 			if (config == null) {
 				config = new TLSConfig(TLSEngine.CLIENT);
+			}
+			
+			// Clean up old engine listeners to prevent double event processing
+			if (_engine) {
+				_engine.removeEventListener(TLSEvent.DATA, onTLSData);
+				_engine.removeEventListener(TLSEvent.READY, onTLSReady);
+				_engine.removeEventListener(Event.CLOSE, onTLSClose);
+				_engine.removeEventListener(TLSEvent.PROMPT_ACCEPT_CERT, onAcceptCert);
+				_socket.removeEventListener(ProgressEvent.SOCKET_DATA, _engine.dataAvailable);
 			}
 			
 			_engine = new TLSEngine(config, _socket, _socket, host);

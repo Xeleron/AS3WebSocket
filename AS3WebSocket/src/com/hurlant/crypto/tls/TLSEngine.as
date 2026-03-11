@@ -59,8 +59,13 @@ package com.hurlant.crypto.tls {
 		public static const CLIENT:uint = 1;
 		public var protocol_version:uint;
 
+		/** Set this from outside (e.g. NetworkManager) to redirect TLS-level trace output. */
+		public static var logger:Function = null;
+		private static function log(msg:String):void {
+			if (logger != null) logger(msg);
+			else trace(msg);
+		}
 
-	
 		private static const PROTOCOL_HANDSHAKE:uint = 22;
 		private static const PROTOCOL_ALERT:uint = 21;
 		private static const PROTOCOL_CHANGE_CIPHER_SPEC:uint = 20;
@@ -212,19 +217,20 @@ package com.hurlant.crypto.tls {
 						// not enough. grab the data and park it.
 						stream.readBytes(p, p.length, stream.bytesAvailable);
 						_packetQueue.push(packet);
-						continue;
+						return; // stop - wait for more data, don't fall through to header read
 					}
 				}
 
 
-				var type:uint = stream.readByte();
-				var ver:uint = stream.readShort();
-				var length:uint = stream.readShort();
+				var type:uint = stream.readUnsignedByte(); // must be unsigned: content types are 0-255
+				var ver:uint = stream.readUnsignedShort();
+				var length:uint = stream.readUnsignedShort();
 				if (length>16384+2048) { // support compression and encryption overhead.
 					throw new TLSError("Excessive TLS Record length: "+length, TLSError.record_overflow);
 				}
-				// Can pretty much assume that if I'm here, I've got a default config, so let's use it.
-				if (ver != _securityParameters.version ) {
+				// Accept SSL 3.0 (0x0300) and TLS 1.0 (0x0301) at the record layer.
+				// Some servers send 0x0300 in early records even when negotiating TLS 1.0.
+				if (ver < 0x0300 || ver > 0x0301) {
 					throw new TLSError("Unsupported TLS version: "+ver.toString(16), TLSError.protocol_version);
 				}
 
@@ -351,7 +357,7 @@ package com.hurlant.crypto.tls {
 			// is required, as was the case using the switch statement. BP
 			if (_entityHandshakeHandlers.hasOwnProperty( type )) {
 				if (_entityHandshakeHandlers[ type ] is Function) 
-					_entityHandshakeHandlers[ type ]( rec );
+					_entityHandshakeHandlers[ type ]( rec, length );
 			} else {
 				throw new TLSError( "Unimplemented or unknown handshake type!", TLSError.internal_error );
 			}
@@ -370,7 +376,7 @@ package com.hurlant.crypto.tls {
 		 * Throw an error when the detected handshake state isn't a valid state for the given entity type (client vs. server, etc. ).
 		 * This really should abort the handshake, since there's no case in which a server should EVER be confused about the type of entity it is. BP
 		 */
-		private function notifyStateError( rec:ByteArray ) : void {
+		private function notifyStateError( rec:ByteArray, length:uint = 0 ) : void {
 			throw new TLSError( "Invalid handshake state for a TLS Entity type of " + _entity, TLSError.internal_error ); 
 		}
 		
@@ -381,14 +387,14 @@ package com.hurlant.crypto.tls {
 			throw new TLSError( "ClientKeyExchange is currently unimplemented!", TLSError.internal_error );
 		}
 		
-		private function parseServerKeyExchange( rec:ByteArray ) : void {
+		private function parseServerKeyExchange( rec:ByteArray, length:uint = 0 ) : void {
 			throw new TLSError( "ServerKeyExchange is currently unimplemented!", TLSError.internal_error );
 		}
 		
 		/**
 		 * Test the server's Finished message for validity against the data we know about. Only slightly rewritten. BP
 		 */
-		private function verifyHandshake( rec:ByteArray):void {
+		private function verifyHandshake( rec:ByteArray, length:uint = 0):void {
 			// Get the Finished message
 			var verifyData:ByteArray = new ByteArray;
 			// This, in the vain hope that noboby is using SSL 2 anymore
@@ -402,6 +408,7 @@ package com.hurlant.crypto.tls {
 
 			if (ArrayUtil.equals(verifyData, data)) {
 				_state = STATE_READY;
+				log("[TLS] Handshake complete - TLS session established");
 				dispatchEvent(new TLSEvent(TLSEvent.READY));
 			} else {
 				throw new TLSError("Invalid Finished mac.", TLSError.bad_record_mac);
@@ -413,7 +420,7 @@ package com.hurlant.crypto.tls {
 		/**
 		 * Handle a HANDSHAKE_HELLO
 		 */
-		private function parseHandshakeHello( rec:ByteArray ) : void {
+		private function parseHandshakeHello( rec:ByteArray, length:uint = 0 ) : void {
 			if (_state != STATE_READY) {
 				trace("Received an HELLO_REQUEST before being in state READY. ignoring.");
 				return;
@@ -425,7 +432,7 @@ package com.hurlant.crypto.tls {
 		/**
 		 * Handle a HANDSHAKE_CLIENT_KEY_EXCHANGE
 		 */
-		private function parseHandshakeClientKeyExchange(rec:ByteArray):void {
+		private function parseHandshakeClientKeyExchange(rec:ByteArray, length:uint = 0):void {
 			if (_securityParameters.useRSA) {
 				// skip 2 bytes for length.
 				var len:uint = rec.readShort();
@@ -449,7 +456,7 @@ package com.hurlant.crypto.tls {
 		/** 
 		 * Handle HANDSHAKE_SERVER_HELLO - client-side
 		 */
-		private function parseHandshakeServerHello( rec:IDataInput ) : void {
+		private function parseHandshakeServerHello( rec:IDataInput, length:uint = 0 ) : void {
 			
 			var ver:uint = rec.readShort(); 
 			if (ver != _securityParameters.version) {
@@ -457,7 +464,7 @@ package com.hurlant.crypto.tls {
 			}			
 			var random:ByteArray = new ByteArray;
 			rec.readBytes(random, 0, 32);
-			var session_length:uint = rec.readByte();
+			var session_length:uint = rec.readUnsignedByte();
 			var session:ByteArray = new ByteArray;
 			if (session_length > 0) {
 				// some implementations don't assign a session ID
@@ -472,7 +479,7 @@ package com.hurlant.crypto.tls {
 		/**
 		 *  Handle HANDSHAKE_CLIENT_HELLO - server side
 		 */
-		private function parseHandshakeClientHello( rec:IDataInput ) : void {
+		private function parseHandshakeClientHello( rec:IDataInput, length:uint = 0 ) : void {
 			var ret:Object;
 			var ver:uint = rec.readShort(); 
 			if (ver != _securityParameters.version) {
@@ -505,7 +512,7 @@ package com.hurlant.crypto.tls {
 			
 			var sofar:uint = 2+32+1+session_length+2+suites_length+1+comp_length;
 			var extensions:Array = [];
-			if (sofar<length) {
+			if (rec.bytesAvailable > 0) {
 				// we have extensions. great.
 				var ext_total_length:uint = rec.readShort();
 				while (ext_total_length>0) {
@@ -536,9 +543,8 @@ package com.hurlant.crypto.tls {
 			prng.nextBytes(clientRandom, 32);
 			_securityParameters.setClientRandom(clientRandom);
 			rec.writeBytes(clientRandom,0,32);
-			// session
-			rec.writeByte(32);
-			prng.nextBytes(rec, 32);
+			// session ID - empty for new connection
+			rec.writeByte(0);
 			// Cipher suites
 			var cs:Array = _config.cipherSuites;
 			rec.writeShort(2* cs.length);
@@ -551,7 +557,29 @@ package com.hurlant.crypto.tls {
 			for (i=0;i<cs.length;i++) {
 				rec.writeByte(cs[i]);
 			}
-			// no extensions, yet.
+			// TLS Extensions block - build into a scratch ByteArray then prepend length
+			var exts:ByteArray = new ByteArray();
+			// RFC 5746: renegotiation_info (type 0xFF01) - empty for initial handshake
+			// Required by many servers; without it a strict server sends handshake_failure.
+			exts.writeShort(0xFF01);  // extension type
+			exts.writeShort(0x0001);  // extension data length
+			exts.writeByte(0x00);     // renegotiated_connection length = 0 (initial)
+			// RFC 6066: server_name (SNI, type 0x0000)
+			// Required for virtual-hosted TLS endpoints (e.g. shared-IP wss:// servers).
+			if (_otherIdentity != null && _otherIdentity.length > 0) {
+				var hostnameBytes:ByteArray = new ByteArray();
+				hostnameBytes.writeMultiByte(_otherIdentity, "us-ascii");
+				var hostnameLen:int = hostnameBytes.length;
+				exts.writeShort(0x0000);           // extension type: server_name
+				exts.writeShort(hostnameLen + 5);  // extension data length (list_len + name_type + name_len + name)
+				exts.writeShort(hostnameLen + 3);  // server_name_list length (name_type + name_len + name)
+				exts.writeByte(0x00);              // name type: host_name (0)
+				exts.writeShort(hostnameLen);      // name length
+				exts.writeBytes(hostnameBytes);    // name bytes
+			}
+			rec.writeShort(exts.length);  // total extensions length
+			exts.position = 0;
+			rec.writeBytes(exts);
 			rec.position = 0;
 			sendHandshake(HANDSHAKE_CLIENT_HELLO, rec.length, rec);
 		}
@@ -574,7 +602,7 @@ package com.hurlant.crypto.tls {
 			_securityParameters.setCipher(cipher);
 			
 			var comp:int = findMatch(_config.compressions, v.compressions);
-			if (comp == 01) {
+			if (comp == -1) {
 				throw new TLSError("No compatible compression method found.", TLSError.handshake_failure);
 			}
 			_securityParameters.setCompression(comp);
@@ -592,15 +620,15 @@ package com.hurlant.crypto.tls {
 			rec.writeByte(32);
 			prng.nextBytes(rec, 32);
 			// Cipher suite
-			rec.writeShort(v.suites[0]);
+			rec.writeShort(cipher);
 			// Compression
-			rec.writeByte(v.compressions[0]);
+			rec.writeByte(comp);
 			rec.position = 0;
 			sendHandshake(HANDSHAKE_SERVER_HELLO, rec.length, rec);
 		}
 		
 		private var sendClientCert:Boolean = false;
-		private function setStateRespondWithCertificate( r:ByteArray = null) : void {
+		private function setStateRespondWithCertificate( r:ByteArray = null, length:uint = 0) : void {
 			sendClientCert = true;
 		}
 		
@@ -711,6 +739,7 @@ package com.hurlant.crypto.tls {
 			// This addresses data overflow issues when the packet size hits the max length boundary.
 			if (len == 0) len = data.length;  
 			while (len>16384) {
+				rec.length = 0;
 				rec.position = 0;
 				rec.writeBytes(data, offset, 16384);
 				rec.position = 0;
@@ -718,6 +747,7 @@ package com.hurlant.crypto.tls {
 				offset += 16384;
 				len -= 16384;
 			}
+			rec.length = 0;
 			rec.position = 0;
 			rec.writeBytes(data, offset, len);
 			// trace("Data I'm sending..." + Hex.fromArray( data ));
@@ -749,7 +779,7 @@ package com.hurlant.crypto.tls {
 			}
 		}
 		
-		private function sendClientAck( rec:ByteArray ):void {
+		private function sendClientAck( rec:ByteArray, length:uint = 0 ):void {
 			if ( _handshakeCanContinue ) {
 				// If I have a pending cert request, send it
 				if (sendClientCert)
@@ -772,14 +802,14 @@ package com.hurlant.crypto.tls {
 		 * As long as that certificate looks just the way we expect it to.
 		 * 
 		 */
-		private function loadCertificates( rec:ByteArray ):void {
-			var tmp:uint = rec.readByte();
-			var certs_len:uint = (tmp<<16) | rec.readShort();
+		private function loadCertificates( rec:ByteArray, length:uint = 0 ):void {
+			var tmp:uint = rec.readUnsignedByte();
+			var certs_len:uint = (tmp<<16) | rec.readUnsignedShort();
 			var certs:Array = [];
 			
 			while (certs_len>0) {
-				tmp = rec.readByte();
-				var cert_len:uint = (tmp<<16) | rec.readShort();
+				tmp = rec.readUnsignedByte();
+				var cert_len:uint = (tmp<<16) | rec.readUnsignedShort();
 				var cert:ByteArray = new ByteArray;
 				rec.readBytes(cert, 0, cert_len);
 				certs.push(cert);
@@ -859,13 +889,39 @@ package com.hurlant.crypto.tls {
 		}
 		
 		
-		private function parseAlert(p:ByteArray):void {
-			//throw new Error("Alert not implemented.");
-			// 7.2
-			trace("GOT ALERT! type="+p[1]);
+		private function parseAlert(p:ByteArray):ByteArray {
+			var level:uint = p[0];
+			var desc:uint  = p[1];
+			var levelStr:String = (level == 2) ? "FATAL" : "WARNING";
+			var descStr:String;
+			switch (desc) {
+				case 0:   descStr = "close_notify"; break;
+				case 10:  descStr = "unexpected_message"; break;
+				case 20:  descStr = "bad_record_mac"; break;
+				case 22:  descStr = "record_overflow"; break;
+				case 40:  descStr = "handshake_failure"; break;
+				case 42:  descStr = "bad_certificate"; break;
+				case 43:  descStr = "unsupported_certificate"; break;
+				case 44:  descStr = "certificate_revoked"; break;
+				case 45:  descStr = "certificate_expired"; break;
+				case 46:  descStr = "certificate_unknown"; break;
+				case 47:  descStr = "illegal_parameter"; break;
+				case 48:  descStr = "unknown_ca"; break;
+				case 50:  descStr = "decode_error"; break;
+				case 51:  descStr = "decrypt_error"; break;
+				case 70:  descStr = "protocol_version"; break;
+				case 71:  descStr = "insufficient_security"; break;
+				case 80:  descStr = "internal_error"; break;
+				case 90:  descStr = "user_canceled"; break;
+				case 100: descStr = "no_renegotiation"; break;
+				case 110: descStr = "unsupported_extension"; break;
+				default:  descStr = "code=" + desc; break;
+			}
+			log("[TLS] Alert " + levelStr + ": " + descStr);
 			close();
+			return null;
 		}
-		private function parseChangeCipherSpec(p:ByteArray):void {
+		private function parseChangeCipherSpec(p:ByteArray):ByteArray {
 			p.readUnsignedByte();
 			if (_pendingReadState==null) {
 				throw new TLSError("Not ready to Change Cipher Spec, damnit.", TLSError.unexpected_message);
@@ -873,13 +929,15 @@ package com.hurlant.crypto.tls {
 			_currentReadState = _pendingReadState;
 			_pendingReadState = null;
 			// 7.1
+			return null;
 		}
-		private function parseApplicationData(p:ByteArray):void {
+		private function parseApplicationData(p:ByteArray):ByteArray {
 			if (_state != STATE_READY) {
 				throw new TLSError("Too soon for data!", TLSError.unexpected_message);
-				return;
+				return null;
 			}
 			dispatchEvent(new TLSEvent(TLSEvent.DATA, p));
+			return null;
 		}
 		
 		private function handleTLSError(e:TLSError):void {

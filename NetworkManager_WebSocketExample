@@ -1,0 +1,1444 @@
+package game
+{
+    import core.*;
+
+    import com.worlize.websocket.WebSocket;
+    import com.worlize.websocket.WebSocketEvent;
+    import com.worlize.websocket.WebSocketErrorEvent;
+    import com.worlize.websocket.WebSocketMessage;
+    import com.hurlant.crypto.tls.TLSEngine;
+
+    import flash.events.IOErrorEvent;
+    import flash.events.SecurityErrorEvent;
+    import flash.events.TimerEvent;
+    import flash.utils.Timer;
+
+    import com.adobe.serialization.json.JSONHelper;
+
+    /**
+     * Network manager for server communication using AS3WebSocket.
+     * Speaks the SmartFoxServer wire protocol (XML sys messages, %xt% strings, JSON)
+     * over WebSocket binary frames.
+     */
+    public class NetworkManager implements IDisposable
+    {
+        public static const SERVER_HOST:String = "servertest.aq.com";
+        public static const WS_PORT:int = 80;
+        public static const WSS_PORT:int = 443;
+
+        private static var _useSecureTransport:Boolean = false;
+
+        private var _game:Game;
+        private var _ws:WebSocket;
+        private var _eventManager:EventManager;
+        private var _disposed:Boolean;
+
+        private var _connected:Boolean;
+        private var _connecting:Boolean;
+
+        public static function get useSecureTransport():Boolean
+        {
+            return _useSecureTransport;
+        }
+
+        public static function set useSecureTransport(value:Boolean):void
+        {
+            _useSecureTransport = value;
+        }
+
+        public static function toggleTransport():void
+        {
+            _useSecureTransport = !_useSecureTransport;
+        }
+
+        public static function get serverUrl():String
+        {
+            return _useSecureTransport
+                ? "wss://" + SERVER_HOST + ":" + WSS_PORT
+                : "ws://" + SERVER_HOST + ":" + WS_PORT;
+        }
+
+        public static function get transportLabel():String
+        {
+            return _useSecureTransport ? "WSS :443" : "WS :80";
+        }
+
+        // Reconnection settings
+        private var _reconnectAttempts:int;
+        private var _maxReconnectAttempts:int = 3;
+        private var _reconnectDelay:int = 10000;
+        private var _pollTimer:Timer;
+        private var _lastFailureMessage:String;
+
+        // Message handling
+        private var _messageHandlers:Object;
+
+        // Login zone
+        public static const LOGIN_ZONE:String = "zone_master";
+
+        // SFS-compatible state (accessed via .sfc shim by World.as etc.)
+        public var myUserId:int = -1;
+        public var myUserName:String = "";
+        public var amIModerator:Boolean = false;
+        public var activeRoomId:int = -1;
+
+        // Signals
+        public var onConnected:Signal;
+        public var onDisconnected:Signal;
+        public var onError:Signal;
+        public var onMessage:Signal;
+        public var onExtensionResponse:Signal;
+
+        public function NetworkManager(game:Game)
+        {
+            _game = game;
+            _eventManager = new EventManager(this);
+            _disposed = false;
+            _connected = false;
+            _connecting = false;
+            _reconnectAttempts = 0;
+
+            _messageHandlers = {};
+
+            // Initialize signals
+            onConnected = new Signal();
+            onDisconnected = new Signal();
+            onError = new Signal();
+            onMessage = new Signal();
+            onExtensionResponse = new Signal();
+        }
+
+        /**
+         * Connect to the selected game server transport.
+         * IP/port params are ignored – we always connect to serverUrl.
+         */
+        public function connect(serverIP:String = null, serverPort:int = 0):void
+        {
+            var endpoint:String = serverUrl;
+            debug("connect() -> " + endpoint);
+            debug("disposed=" + _disposed + " connecting=" + _connecting + " connected=" + _connected);
+
+            if (_disposed || _connecting || _connected)
+            {
+                debug("Skipping - already in progress");
+                return;
+            }
+
+            _connecting = true;
+            _reconnectAttempts = 0;
+            _lastFailureMessage = null;
+
+            try
+            {
+                // Redirect both WebSocket and TLS library loggers to the on-screen debug panel
+                var g:Game = _game;
+                var logFn:Function = function(text:String):void {
+                    trace(text);
+                    if (g) g.debugLog(text);
+                };
+                WebSocket.logger = logFn;
+                TLSEngine.logger = logFn;
+
+                _ws = new WebSocket(endpoint, "*", null, 15000);
+                _ws.debug = true;
+
+                if (useSecureTransport)
+                    debug("WSS selected - AS3 TLS support is limited to TLS 1.0 and may fail against modern servers");
+
+                // WebSocket high-level events
+                _ws.addEventListener(WebSocketEvent.OPEN, onWSOpen);
+                _ws.addEventListener(WebSocketEvent.CLOSED, onWSClosed);
+                _ws.addEventListener(WebSocketEvent.MESSAGE, onWSMessage);
+                _ws.addEventListener(WebSocketErrorEvent.CONNECTION_FAIL, onWSError);
+                _ws.addEventListener(WebSocketErrorEvent.ABNORMAL_CLOSE, onWSAbnormalClose);
+
+                // The library re-dispatches raw socket IOError / SecurityError
+                // as standard flash events — we must catch them here too.
+                _ws.addEventListener(IOErrorEvent.IO_ERROR, onWSIOError);
+                _ws.addEventListener(SecurityErrorEvent.SECURITY_ERROR, onWSSecurityError);
+
+                debug("ws host=" + _ws.host + " port=" + _ws.port + " secure=" + _ws.secure);
+                debug("Calling ws.connect()...");
+                _ws.connect();
+                debug("ws.connect() returned OK  readyState=" + _ws.readyState);
+
+                // Poll socket state every second for diagnostics
+                _pollTimer = new Timer(1000, 10);
+                _pollTimer.addEventListener(TimerEvent.TIMER, onPollSocket);
+                _pollTimer.start();
+            }
+            catch (e:Error)
+            {
+                debug("Exception: " + e.message);
+                handleError("Connection failed: " + e.message);
+            }
+        }
+
+        private function debug(msg:String):void
+        {
+            trace("[NM] " + msg);
+            if (_game)
+                _game.debugLog("[NM] " + msg);
+        }
+
+        // ==================== WebSocket Event Handlers ====================
+
+        private function onWSOpen(e:WebSocketEvent):void
+        {
+            debug("WebSocket OPEN");
+            _connected = true;
+            _connecting = false;
+            _reconnectAttempts = 0;
+
+            onConnected.dispatch();
+
+            // Send SFS version check to initiate the SFS handshake over WebSocket
+            sendRaw("<msg t='sys'><body action='verChk' r='0'><ver v='157' /></body></msg>");
+        }
+
+        private function onWSClosed(e:WebSocketEvent):void
+        {
+            debug("WebSocket CLOSED");
+            stopPollTimer();
+
+            if (_lastFailureMessage)
+            {
+                debug("Ignoring CLOSED after prior failure: " + _lastFailureMessage);
+                _connected = false;
+                _connecting = false;
+                return;
+            }
+
+            var failedDuringSecureConnect:Boolean = _connecting && !_connected && useSecureTransport;
+            _connected = false;
+            _connecting = false;
+
+            if (failedDuringSecureConnect)
+            {
+                handleError("WSS connection failed during TLS/WebSocket handshake. Check debug log for TLS Alert code.");
+                return;
+            }
+
+            onDisconnected.dispatch("Connection lost");
+
+            if (_game)
+                _game.handleConnectionLost("Connection to server lost");
+        }
+
+        private function onWSError(e:WebSocketErrorEvent):void
+        {
+            debug("WebSocket ERROR: " + e.text);
+            if (useSecureTransport)
+                debug("WSS error during TLS/WebSocket handshake (TLS 1.0 with SNI + renegotiation_info)");
+            handleError("WebSocket error: " + e.text);
+        }
+
+        private function onWSAbnormalClose(e:WebSocketErrorEvent):void
+        {
+            debug("WebSocket ABNORMAL CLOSE: " + e.text);
+            stopPollTimer();
+            _connected = false;
+            _connecting = false;
+
+            onDisconnected.dispatch("Connection lost (abnormal)");
+
+            if (_game)
+                _game.handleConnectionLost("Connection lost unexpectedly");
+        }
+
+        private function onWSIOError(e:IOErrorEvent):void
+        {
+            debug("WebSocket IO_ERROR: " + e.text);
+            if (useSecureTransport)
+                debug("WSS IO_ERROR - likely TCP-level rejection before TLS handshake reached the server");
+            handleError("IO Error: " + e.text);
+        }
+
+        private function onWSSecurityError(e:SecurityErrorEvent):void
+        {
+            debug("WebSocket SECURITY_ERROR: " + e.text);
+            if (useSecureTransport)
+                debug("WSS SECURITY_ERROR - check debug log for TLS Alert from server");
+            handleError("Security Error: " + e.text);
+        }
+
+        private function onPollSocket(e:TimerEvent):void
+        {
+            if (!_ws) return;
+            var rs:int = _ws.readyState;
+            var sc:Boolean = false;
+            try { sc = _ws.connected; } catch (err:Error) {}
+            debug("POLL: readyState=" + rs + " connected=" + sc + " _connected=" + _connected);
+            if (rs != 0) // No longer CONNECTING - stop polling
+            {
+                stopPollTimer();
+            }
+        }
+
+        private function stopPollTimer():void
+        {
+            if (_pollTimer)
+            {
+                _pollTimer.stop();
+                _pollTimer = null;
+            }
+        }
+
+        /**
+         * Handle incoming WebSocket messages (text or binary).
+         * A single WebSocket frame may contain multiple null-byte delimited SFS messages.
+         */
+        private function onWSMessage(e:WebSocketEvent):void
+        {
+            if (!e.message)
+                return;
+
+            var raw:String;
+            if (e.message.type == WebSocketMessage.TYPE_UTF8)
+            {
+                raw = e.message.utf8Data;
+            }
+            else if (e.message.type == WebSocketMessage.TYPE_BINARY && e.message.binaryData)
+            {
+                e.message.binaryData.position = 0;
+                raw = e.message.binaryData.readUTFBytes(e.message.binaryData.bytesAvailable);
+            }
+            else
+            {
+                return;
+            }
+            if (!raw || raw.length == 0)
+                return;
+
+            // SFS protocol: messages are null-byte (0x00) delimited
+            var messages:Array = raw.split(String.fromCharCode(0));
+            for each (var msg:String in messages)
+            {
+                if (msg.length > 0)
+                    processMessage(msg);
+            }
+        }
+
+        /**
+         * Process a single SFS protocol message (XML, JSON or %xt% string).
+         */
+        private function processMessage(msg:String):void
+        {
+            var c:String = msg.charAt(0);
+
+            if (c == "<")
+            {
+                // XML system message
+                processXmlMessage(msg);
+            }
+            else if (c == "{")
+            {
+                // JSON extension message
+                processJsonMessage(msg);
+            }
+            else if (c == "%")
+            {
+                // String extension message
+                processStrMessage(msg);
+            }
+            else
+            {
+                debug("Unknown message format: " + msg.substr(0, 40));
+            }
+        }
+
+        private function processXmlMessage(msg:String):void
+        {
+            try
+            {
+                var xml:XML = new XML(msg);
+                var msgType:String = xml.@t;
+
+                if (msgType == "sys")
+                {
+                    var action:String = xml.body.@action;
+                    debug("SYS: " + action);
+
+                    switch (action)
+                    {
+                        case "apiOK":
+                            // SFS handshake complete – now send login
+                            debug("API OK – sending login");
+                            sendLogin();
+                            break;
+                        case "apiKO":
+                            handleError("API Version Mismatch");
+                            break;
+                        case "logOK":
+                            handleSysLoginOk(xml);
+                            break;
+                        case "logKO":
+                            var loginErr:String = xml.body.login.@e || "Login failed";
+                            if (_game)
+                                _game.handleLoginFailure(loginErr);
+                            break;
+                        case "logout":
+                            if (_game)
+                                _game.handleLogout();
+                            break;
+                        case "joinOK":
+                            handleSysJoinOk(xml);
+                            break;
+                        case "uER":
+                            handleSysUserEnterRoom(xml);
+                            break;
+                        default:
+                            debug("Unhandled SYS action: " + action);
+                            break;
+                    }
+                }
+            }
+            catch (e:Error)
+            {
+                debug("XML parse error: " + e.message);
+            }
+        }
+
+        private function handleSysLoginOk(xml:XML):void
+        {
+            var uid:int = int(xml.body.login.@id);
+            var uname:String = xml.body.login.@n;
+            var mod:Boolean = (xml.body.login.@m == "1");
+
+            myUserId = uid;
+            myUserName = uname;
+            amIModerator = mod;
+
+            debug("Logged in as " + uname + " (uid=" + uid + ")");
+
+            if (_game)
+                _game.handleLoginSuccess({success: true, name: uname});
+        }
+
+        private function handleSysJoinOk(xml:XML):void
+        {
+            var roomId:int = int(xml.body.@r);
+            activeRoomId = roomId;
+            debug("Joined room " + roomId);
+        }
+
+        private function handleSysUserEnterRoom(xml:XML):void
+        {
+            var roomId:int = int(xml.body.@r);
+            var uId:int = int(xml.body.u.@i);
+            var uName:String = xml.body.u.n;
+
+            debug("User enter room: " + uName + " (id=" + uId + ")");
+
+            if (_game && _game.world)
+            {
+                var userData:Object = {
+                    uid: uId,
+                    strUsername: uName,
+                    isMyAvatar: (uId == myUserId)
+                };
+                _game.world.handleUserEnterRoom(userData);
+            }
+        }
+
+        private function processJsonMessage(msg:String):void
+        {
+            try
+            {
+                var data:Object = JSONHelper.decode(msg);
+                var dataObj:Object = data;
+                var cmd:String;
+
+                // Unwrap SFS JSON envelope: { "t": "xt", "b": { "r": -1, "o": { "cmd": "...", ... } } }
+                if (data.t == "xt" && data.b)
+                {
+                    dataObj = data.b;
+                    if (dataObj.o)
+                    {
+                        cmd = dataObj.o.cmd;
+                        if (cmd)
+                            dataObj = dataObj.o;
+                    }
+                }
+                if (!cmd)
+                    cmd = dataObj.cmd;
+
+                debug("JSON cmd: " + cmd);
+                handleJsonCommand(dataObj);
+                onExtensionResponse.dispatch(dataObj, "json");
+                onMessage.dispatch(dataObj);
+                dispatchToHandlers(cmd, dataObj);
+            }
+            catch (e:Error)
+            {
+                debug("JSON parse error: " + e.message);
+            }
+        }
+
+        private function processStrMessage(msg:String):void
+        {
+            var parts:Array = msg.split("%");
+            // parts: ["", "xt", extensionName, cmd, roomId, ...]
+            if (parts.length < 4)
+                return;
+            if (parts[1] != "xt")
+                return;
+
+            // Build the data array that handlers expect: [cmd, roomId, ...]
+            // Original SFS ExtHandler passed params.slice(2) which gives [extName, cmd, roomId, ...]
+            // Then NetworkManager expected data[0]=cmd. Let's match that:
+            var dataArr:Array = parts.slice(2); // [extName, cmd, roomId, ...]
+            var cmd:String = dataArr[0];
+
+            debug("STR cmd: " + cmd);
+            handleStrCommand(dataArr);
+            onExtensionResponse.dispatch(dataArr, "str");
+            onMessage.dispatch(dataArr);
+            dispatchToHandlers(cmd, dataArr);
+        }
+
+        private function dispatchToHandlers(cmd:String, data:Object):void
+        {
+            if (cmd && _messageHandlers[cmd])
+            {
+                var handlers:Array = _messageHandlers[cmd];
+                for each (var handler:Function in handlers)
+                {
+                    try
+                    {
+                        handler(data);
+                    }
+                    catch (err:Error)
+                    {
+                        trace("[NetworkManager] Handler error: " + err.message);
+                    }
+                }
+            }
+        }
+
+        /**
+         * Handle string protocol commands from the server.
+         */
+        private function handleStrCommand(data:Array):void
+        {
+            var cmd:String = data[0];
+
+            switch (cmd)
+            {
+                case "loginResponse":
+                    handleLoginResponse(data);
+                    break;
+
+                case "server":
+                    // Server message - just log it
+                    debug("Server msg: " + data[2]);
+                    break;
+
+                case "moveToArea":
+                    handleMoveToArea(data);
+                    break;
+
+                case "initUserData":
+                    handleInitUserData(data);
+                    break;
+
+                case "uotls":
+                    // User object list string - contains movement data
+                    handleStrUotls(data);
+                    break;
+
+                case "exitArea":
+                    handleExitArea(data);
+                    break;
+
+                case "chatm":
+                    handleChatMessage(data);
+                    break;
+
+                case "whisper":
+                    handleWhisper(data);
+                    break;
+
+                default:
+                    // Log unhandled commands for debugging
+                    debug("Unhandled cmd: " + cmd);
+                    break;
+            }
+        }
+
+        /**
+         * Handle JSON protocol commands from the server.
+         */
+        private function handleJsonCommand(data:Object):void
+        {
+            var cmd:String = data.cmd;
+
+            switch (cmd)
+            {
+                case "moveToArea":
+                    handleMoveToAreaJson(data);
+                    break;
+
+                case "initUserData":
+                    handleInitUserDataJson(data);
+                    break;
+
+                case "initUserDatas":
+                    handleInitUserDatasJson(data);
+                    break;
+
+                case "uotls":
+                    handleUotlsJson(data);
+                    break;
+
+                case "mtls":
+                    handleMtlsJson(data);
+                    break;
+
+                case "loadPrefs":
+                    debug("loadPrefs received");
+                    break;
+
+                    // Equipment commands
+                case "equipItem":
+                    handleEquipItemJson(data);
+                    break;
+
+                case "unequipItem":
+                    handleUnequipItemJson(data);
+                    break;
+
+                case "updateClass":
+                    handleUpdateClass(data);
+                    break;
+
+                    // Combat commands
+                case "ct":
+                    handleCombatTick(data);
+                    break;
+
+                case "cb":
+                    handleCombatBatch(data);
+                    break;
+
+                case "addGoldExp":
+                    handleAddGoldExp(data);
+                    break;
+
+                case "levelUp":
+                    handleLevelUp(data);
+                    break;
+
+                    // Aura commands
+                case "aura+":
+                    handleAuraAdd(data);
+                    break;
+
+                case "aura-":
+                    handleAuraRemove(data);
+                    break;
+
+                    // Server messages
+                case "server":
+                    handleServerMessage(data);
+                    break;
+
+                case "warning":
+                    handleWarning(data);
+                    break;
+
+                default:
+                    debug("Unhandled JSON cmd: " + cmd);
+                    break;
+            }
+        }
+
+        /**
+         * Handle moveToArea - server telling us to load a new map.
+         */
+        private function handleMoveToArea(data:Array):void
+        {
+            debug("moveToArea received");
+
+            // For str protocol, data is an array - need to parse it
+            // Format varies, but key info is usually:
+            // [0] = cmd, [1] = ?, [2] = JSON data or structured data
+
+            if (data.length > 2)
+            {
+                try
+                {
+                    // The data might be a JSON string
+                    var jsonStr:String = String(data[2]);
+                    if (jsonStr.charAt(0) == "{")
+                    {
+                        var mapData:Object = JSONHelper.decode(jsonStr);
+                        debug("Map: " + mapData.strMapName + " Area: " + mapData.areaName);
+
+                        if (_game && _game.world)
+                        {
+                            _game.world.handleMoveToArea(mapData);
+                        }
+                    }
+                }
+                catch (e:Error)
+                {
+                    debug("moveToArea parse error: " + e.message);
+                }
+            }
+        }
+
+        /**
+         * Handle initUserData - player/monster initialization data.
+         */
+        private function handleInitUserData(data:Array):void
+        {
+            debug("initUserData received");
+
+            if (data.length > 2)
+            {
+                try
+                {
+                    var jsonStr:String = String(data[2]);
+                    if (jsonStr.charAt(0) == "{")
+                    {
+                        var userData:Object = JSONHelper.decode(jsonStr);
+                        debug("User data for UID: " + userData.uid);
+
+                        if (_game && _game.world)
+                        {
+                            _game.world.handleInitUserData(userData);
+                        }
+                    }
+                }
+                catch (e:Error)
+                {
+                    debug("initUserData parse error: " + e.message);
+                }
+            }
+        }
+
+        /**
+         * Handle loginResponse from server.
+         * Format: ["loginResponse", ?, success, odataObj, username, ?, serverTime, vars]
+         */
+        private function handleLoginResponse(data:Array):void
+        {
+            var success:* = data[2];
+
+            if (success == 1 || success == "true" || success == "True")
+            {
+                debug("loginResponse: SUCCESS");
+
+                // Store user ID and name from response
+                myUserId = Number(data[3]);
+                myUserName = String(data[4]);
+
+                debug("UserID: " + myUserId + " Name: " + myUserName);
+
+                // Parse server variables if present
+                if (data[7])
+                {
+                    var vars:Array = String(data[7]).split(",");
+                    debug("Server vars: " + vars.length);
+                }
+
+                // Now send firstJoin to enter the game
+                debug("Sending firstJoin...");
+                sendExtensionMessage("firstJoin", [], "str", 1);
+
+                if (_game)
+                    _game.debugLog("Joining lobby...");
+            }
+            else
+            {
+                var errorMsg:String = data[5] || "Login failed";
+                debug("loginResponse: FAILED - " + errorMsg);
+
+                if (_game)
+                    _game.handleLoginFailure(errorMsg);
+            }
+        }
+
+        /**
+         * Handle moveToArea JSON command.
+         */
+        private function handleMoveToAreaJson(data:Object):void
+        {
+            debug("moveToArea JSON: " + data.strMapName + " (" + data.areaName + ")");
+
+            // Ensure world exists before trying to load map
+            if (!_game.world)
+            {
+                debug("Creating world for map load");
+                _game.createWorld();
+            }
+
+            if (_game && _game.world)
+            {
+                _game.world.handleMoveToArea(data);
+            }
+        }
+
+        /**
+         * Handle exitArea - player left the area.
+         * Format: %xt%exitArea%-1%{uid}%{username}%
+         * data[0]=exitArea, data[1]=-1(room), data[2]=uid, data[3]=username
+         */
+        private function handleExitArea(data:Array):void
+        {
+            if (data.length < 4)
+                return;
+
+            var uid:int = int(data[2]);
+            var username:String = data[3] || "";
+
+            debug("exitArea: " + username + " (uid=" + uid + ")");
+
+            if (_game && _game.world)
+            {
+                _game.world.handleExitArea(uid, username);
+            }
+        }
+
+        /**
+         * Handle chatm - chat message received.
+         * Format: %xt%chatm%-1%message%username%uid%roomId%isMod%
+         */
+        private function handleChatMessage(data:Array):void
+        {
+            if (data.length < 5)
+                return;
+
+            var msgData:String = String(data[2]);
+            var username:String = String(data[3]);
+            var uid:int = int(data[4]);
+
+            // Parse type~message format
+            var sepIndex:int = msgData.indexOf("~");
+            var msgType:String = sepIndex > -1 ? msgData.substr(0, sepIndex) : "zone";
+            var message:String = sepIndex > -1 ? msgData.substr(sepIndex + 1) : msgData;
+
+            debug("Chat [" + msgType + "] " + username + ": " + message);
+
+            // Map incoming chat types to the ChatPanel filters and show
+            // the message via World so both the chat UI and avatar-bubble
+            // are updated. Legacy server sends `zone` for regular zone chat
+            // — map that to the ChatPanel's `all` filter so it is visible.
+            var chatType:String = msgType;
+            if (msgType == "zone")
+                chatType = "all";
+
+            if (_game && _game.world)
+            {
+                _game.world.showChatBubble(username, message, chatType);
+            }
+        }
+
+        /**
+         * Handle whisper - private message received.
+         */
+        private function handleWhisper(data:Array):void
+        {
+            if (data.length < 4)
+                return;
+
+            var message:String = String(data[2]);
+            var sender:String = String(data[3]);
+            var recipient:String = String(data[4]) || "";
+
+            debug("Whisper from " + sender + ": " + message);
+        }
+
+        /**
+         * Handle str uotls - movement updates for players.
+         * Format: %xt%uotls%-1%username%tx:X,ty:Y,sp:S,strFrame:F%
+         */
+        private function handleStrUotls(data:Array):void
+        {
+            if (data.length < 3)
+                return;
+
+            var username:String = String(data[2]);
+            var params:String = String(data[3] || "");
+
+            // Parse key:value pairs
+            var parsed:Object = {};
+            var pairs:Array = params.split(",");
+            for each (var pair:String in pairs)
+            {
+                var kv:Array = pair.split(":");
+                if (kv.length >= 2)
+                {
+                    parsed[kv[0]] = kv[1];
+                }
+            }
+
+            debug("str uotls: " + username + " tx=" + parsed.tx + " ty=" + parsed.ty);
+
+            // Trigger movement if tx/ty present
+            if (parsed.tx != null && parsed.ty != null && _game && _game.world)
+            {
+                _game.world.handleStrUotls(username, parsed);
+            }
+        }
+
+        /**
+         * Handle initUserData JSON command.
+         */
+        private function handleInitUserDataJson(data:Object):void
+        {
+            debug("initUserData JSON for UID: " + data.uid);
+
+            if (_game && _game.world)
+            {
+                _game.world.handleInitUserData(data);
+            }
+        }
+
+        /**
+         * Handle uotls (user object tree list) JSON command.
+         * Contains player position and visual data.
+         */
+        private function handleUotlsJson(data:Object):void
+        {
+            var username:String = data.unm;
+            debug("uotls JSON for: " + username);
+
+            if (_game && _game.world)
+            {
+                // This contains player data - create/update avatar
+                _game.world.handleUotls(data);
+            }
+        }
+
+        /**
+         * Handle initUserDatas - batch user initialization.
+         */
+        private function handleInitUserDatasJson(data:Object):void
+        {
+            debug("initUserDatas JSON received");
+
+            if (!_game || !_game.world || !data.a)
+                return;
+
+            for each (var userData:Object in data.a)
+            {
+                _game.world.handleInitUserData(userData);
+            }
+        }
+
+        /**
+         * Handle mtls - monster tree list update.
+         */
+        private function handleMtlsJson(data:Object):void
+        {
+            debug("mtls JSON for monMapId: " + data.id);
+
+            if (_game && _game.world)
+            {
+                _game.world.handleMtls(data);
+            }
+        }
+
+        /**
+         * Handle equipItem - player equipped an item.
+         */
+        private function handleEquipItemJson(data:Object):void
+        {
+            debug("equipItem for uid: " + data.uid);
+
+            if (_game && _game.world)
+            {
+                _game.world.handleEquipItem(data);
+            }
+        }
+
+        /**
+         * Handle unequipItem - player unequipped an item.
+         */
+        private function handleUnequipItemJson(data:Object):void
+        {
+            debug("unequipItem for uid: " + data.uid);
+
+            if (_game && _game.world)
+            {
+                _game.world.handleUnequipItem(data);
+            }
+        }
+
+        /**
+         * Handle updateClass - player changed their class.
+         */
+        private function handleUpdateClass(data:Object):void
+        {
+            var uid:int = data.uid;
+            debug("updateClass for uid: " + uid + " class: " + data.sClassName);
+
+            if (_game && _game.world)
+            {
+                _game.world.handleUpdateClass(data);
+            }
+        }
+
+        /**
+         * Handle combat tick - HP/MP/state updates.
+         */
+        private function handleCombatTick(data:Object):void
+        {
+            // Update monsters
+            if (data.m)
+            {
+                for (var monId:String in data.m)
+                {
+                    if (_game && _game.world)
+                    {
+                        _game.world.handleMtls({id: int(monId), o: data.m[monId]});
+                    }
+                }
+            }
+
+            // Update players
+            if (data.p)
+            {
+                for (var username:String in data.p)
+                {
+                    if (_game && _game.world)
+                    {
+                        _game.world.handleUotls({unm: username, o: data.p[username]});
+                    }
+                }
+            }
+
+            // Handle auras
+            if (data.a)
+            {
+                for each (var auraEvent:Object in data.a)
+                {
+                    if (auraEvent.cmd == "aura+")
+                        handleAuraAdd(auraEvent);
+                    else if (auraEvent.cmd == "aura-")
+                        handleAuraRemove(auraEvent);
+                }
+            }
+        }
+
+        /**
+         * Handle combat batch - similar to ct but for batch updates.
+         */
+        private function handleCombatBatch(data:Object):void
+        {
+            // Same handling as combat tick
+            handleCombatTick(data);
+        }
+
+        /**
+         * Handle addGoldExp - gold and experience rewards.
+         */
+        private function handleAddGoldExp(data:Object):void
+        {
+            if (!_game || !_game.world || !_game.world.myAvatar)
+                return;
+
+            var myAvatar:* = _game.world.myAvatar;
+
+            if (data.intExp != null && data.intExp > 0)
+            {
+                var deltaXP:int = int(data.intExp);
+                if (myAvatar.objData)
+                {
+                    myAvatar.objData.intExp = int(myAvatar.objData.intExp || 0) + deltaXP;
+                }
+                debug("XP gained: " + deltaXP);
+            }
+
+            if (data.intGold != null && data.intGold > 0)
+            {
+                var deltaGold:int = int(data.intGold);
+                if (myAvatar.objData)
+                {
+                    myAvatar.objData.intGold = int(myAvatar.objData.intGold || 0) + deltaGold;
+                }
+                debug("Gold gained: " + deltaGold);
+            }
+
+            // Class points
+            if (data.iCP != null)
+            {
+                var deltaCP:int = int(data.iCP);
+                if (myAvatar.objData)
+                {
+                    myAvatar.objData.iCP = int(myAvatar.objData.iCP || 0) + deltaCP;
+                }
+                debug("Class Points gained: " + deltaCP);
+            }
+
+            // Faction rep
+            if (data.FactionID != null && data.iRep != null)
+            {
+                debug("Faction " + data.FactionID + " rep: " + data.iRep);
+            }
+        }
+
+        /**
+         * Handle levelUp - player leveled up.
+         */
+        private function handleLevelUp(data:Object):void
+        {
+            if (!_game || !_game.world || !_game.world.myAvatar)
+                return;
+
+            var myAvatar:* = _game.world.myAvatar;
+
+            if (myAvatar.objData)
+            {
+                myAvatar.objData.intLevel = data.intLevel;
+                myAvatar.objData.intExpToLevel = data.intExpToLevel;
+                myAvatar.objData.intExp = data.xp;
+            }
+
+            debug("LEVEL UP! Now level " + data.intLevel);
+
+            // TODO: Show level up visual effect
+        }
+
+        /**
+         * Handle aura+ - aura added to entity.
+         */
+        private function handleAuraAdd(data:Object):void
+        {
+            debug("Aura added: " + data.nam);
+            // TODO: Update entity auras and show visual
+        }
+
+        /**
+         * Handle aura- - aura removed from entity.
+         */
+        private function handleAuraRemove(data:Object):void
+        {
+            debug("Aura removed: " + data.nam);
+            // TODO: Update entity auras and remove visual
+        }
+
+        /**
+         * Handle server message.
+         */
+        private function handleServerMessage(data:Object):void
+        {
+            var msg:String = data.msg || data.s || "";
+            debug("Server: " + msg);
+            // TODO: Show in chat
+        }
+
+        /**
+         * Handle warning message.
+         */
+        private function handleWarning(data:Object):void
+        {
+            var msg:String = data.msg || data.s || "";
+            debug("Warning: " + msg);
+            // TODO: Show warning dialog
+        }
+
+        private function handleError(message:String):void
+        {
+            if (_lastFailureMessage == message)
+            {
+                debug("handleError duplicate ignored: " + message);
+                return;
+            }
+
+            _lastFailureMessage = message;
+            debug("handleError: " + message);
+            _connected = false;
+            _connecting = false;
+            stopPollTimer();
+
+            onError.dispatch(message);
+
+            if (useSecureTransport)
+            {
+                debug("Not reconnecting on WSS failure; this is a deterministic TLS/WebSocket handshake failure");
+                if (_game)
+                    _game.handleConnectionLost(message);
+                return;
+            }
+
+            // Try to reconnect
+            if (_reconnectAttempts < _maxReconnectAttempts)
+            {
+                _reconnectAttempts++;
+                debug("Reconnect attempt " + _reconnectAttempts);
+
+                _game.timerManager.delayCall(_reconnectDelay, function():void
+                    {
+                        connect();
+                    });
+            }
+            else
+            {
+                debug("Max retries reached, giving up");
+                if (_game)
+                    _game.handleConnectionLost(message);
+            }
+        }
+
+        /**
+         * Disconnect from the server.
+         */
+        public function disconnect():void
+        {
+            if (_disposed)
+                return;
+
+            _connected = false;
+            _connecting = false;
+
+            if (_ws)
+            {
+                try { _ws.close(false); } catch (e:Error) {}
+            }
+
+            onDisconnected.dispatch("Disconnected by client");
+        }
+
+        // ==================== Send Helpers ====================
+
+        /**
+         * Send a raw string over the WebSocket as a binary frame (SFS null-byte terminated).
+         */
+        private function sendRaw(msg:String):void
+        {
+            if (!_ws || !_ws.connected)
+                return;
+
+            var payload:flash.utils.ByteArray = new flash.utils.ByteArray();
+            payload.writeUTFBytes(msg);
+            payload.writeByte(0);
+            _ws.sendBytes(payload);
+
+            debug("[TX] " + (msg.length > 120 ? msg.substr(0, 120) + "..." : msg));
+        }
+
+        /**
+         * Send login credentials to the server.
+         * Uses the auth token from loginInfo, not password.
+         */
+        public function sendLogin():void
+        {
+            debug("sendLogin() called");
+
+            if (_disposed || !_connected || !_ws)
+            {
+                debug("sendLogin: disposed=" + _disposed + " connected=" + _connected);
+                return;
+            }
+
+            var loginInfo:Object = _game.loginInfo;
+            if (!loginInfo || !loginInfo.strUsername)
+            {
+                debug("sendLogin: No login info available");
+                return;
+            }
+
+            var username:String = loginInfo.strUsername;
+            var token:String = loginInfo.strToken || loginInfo.sToken || "";
+
+            // Build login string: clientToken~username~clientVersion
+            var loginStr:String = Game.CLIENT_TOKEN + "~" + username + "~" + Game.CLIENT_VERSION;
+
+            debug("Login user: " + username);
+            debug("Login str: " + loginStr);
+            debug("Token len: " + token.length);
+
+            // SFS XML login message
+            var msg:String = "<msg t='sys'><body action='login' r='0'><login z=\'" + LOGIN_ZONE + "\'><nick><![CDATA[" + loginStr + "]]></nick><pword><![CDATA[" + token + "]]></pword></login></body></msg>";
+            sendRaw(msg);
+
+            debug("login sent");
+        }
+
+        /**
+         * Send an extension message to the server.
+         */
+        public function sendExtensionMessage(cmd:String, params:Object = null, type:String = "str", room:int = -1):void
+        {
+            if (_disposed || !_connected || !_ws)
+                return;
+
+            if (room == -1)
+                room = activeRoomId;
+
+            if (type == "str")
+            {
+                var strMsg:String = "%xt%zm%" + cmd + "%" + room + "%";
+                if (params is Array)
+                {
+                    for (var i:int = 0; i < (params as Array).length; i++)
+                    {
+                        strMsg += params[i] + "%";
+                    }
+                }
+                else if (params)
+                {
+                    for (var key:String in params)
+                    {
+                        strMsg += params[key] + "%";
+                    }
+                }
+                sendRaw(strMsg);
+            }
+            else if (type == "json")
+            {
+                var obj:Object = {
+                    t: "xt",
+                    b: {
+                        x: "zm",
+                        c: cmd,
+                        r: room,
+                        p: params
+                    }
+                };
+                sendRaw(JSONHelper.encode(obj));
+            }
+        }
+
+        /**
+         * Send a message (legacy method for compatibility).
+         */
+        public function send(data:*):void
+        {
+            if (_disposed || !_connected || !_ws)
+                return;
+
+            if (data is Object && data.cmd)
+            {
+                sendExtensionMessage(data.cmd, data);
+                return;
+            }
+
+            trace("[NetworkManager] Cannot send raw data: " + data);
+        }
+
+        /**
+         * Send move command to server.
+         */
+        public function sendMove(tx:int, ty:int, sp:int = 8):void
+        {
+            if (_disposed || !_connected || !_ws)
+                return;
+
+            var data:Array = ["mv", tx, ty, sp];
+            sendExtensionMessage("mv", data, "str", 1);
+
+            debug("Sent move: tx=" + tx + " ty=" + ty);
+        }
+
+        /**
+         * Register a handler for a specific message type.
+         */
+        public function registerHandler(type:String, handler:Function):void
+        {
+            if (!_messageHandlers[type])
+                _messageHandlers[type] = [];
+
+            _messageHandlers[type].push(handler);
+        }
+
+        /**
+         * Unregister a handler.
+         */
+        public function unregisterHandler(type:String, handler:Function):void
+        {
+            if (!_messageHandlers[type])
+                return;
+
+            var handlers:Array = _messageHandlers[type];
+            var index:int = handlers.indexOf(handler);
+            if (index != -1)
+                handlers.splice(index, 1);
+        }
+
+        /**
+         * Clear all handlers.
+         */
+        public function clearHandlers():void
+        {
+            _messageHandlers = {};
+        }
+
+        /**
+         * Compatibility shim: returns `this` so that World.as code like
+         * _game.networkManager.sfc.myUserId still works. The properties
+         * myUserId, myUserName, activeRoomId live directly on NetworkManager.
+         */
+        public function get sfc():NetworkManager
+        {
+            return this;
+        }
+
+        /**
+         * Compatibility: sendXtMessage used by World.as via sfc accessor.
+         */
+        public function sendXtMessage(name:String, cmd:String, params:*, type:String = "str", roomId:int = -1):void
+        {
+            sendExtensionMessage(cmd, params, type, roomId);
+        }
+
+        public function get connected():Boolean
+        {
+            return _connected;
+        }
+        public function get connecting():Boolean
+        {
+            return _connecting;
+        }
+        public function get isDisposed():Boolean
+        {
+            return _disposed;
+        }
+
+        /**
+         * Dispose of the network manager.
+         */
+        public function dispose():void
+        {
+            if (_disposed)
+                return;
+
+            disconnect();
+
+            if (_ws)
+            {
+                _ws.removeEventListener(WebSocketEvent.OPEN, onWSOpen);
+                _ws.removeEventListener(WebSocketEvent.CLOSED, onWSClosed);
+                _ws.removeEventListener(WebSocketEvent.MESSAGE, onWSMessage);
+                _ws.removeEventListener(WebSocketErrorEvent.CONNECTION_FAIL, onWSError);
+                _ws.removeEventListener(WebSocketErrorEvent.ABNORMAL_CLOSE, onWSAbnormalClose);
+                _ws.removeEventListener(IOErrorEvent.IO_ERROR, onWSIOError);
+                _ws.removeEventListener(SecurityErrorEvent.SECURITY_ERROR, onWSSecurityError);
+                _ws = null;
+            }
+
+            // Dispose signals
+            onConnected.dispose();
+            onDisconnected.dispose();
+            onError.dispose();
+            onMessage.dispose();
+            onExtensionResponse.dispose();
+
+            // Dispose event manager
+            if (_eventManager)
+            {
+                _eventManager.dispose();
+                _eventManager = null;
+            }
+
+            clearHandlers();
+
+            _game = null;
+
+            _disposed = true;
+        }
+    }
+}
