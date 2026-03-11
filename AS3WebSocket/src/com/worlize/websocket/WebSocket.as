@@ -86,6 +86,11 @@ package com.worlize.websocket
 		private var fragmentationOpcode:int = 0;
 		private var fragmentationSize:uint = 0;
 		
+		// permessage-deflate (RFC 7692)
+		private var _deflateEnabled:Boolean = false;
+		private var _enablePerMessageDeflate:Boolean = true;
+		private var _deflateThreshold:uint = 1024;
+		
 		private var waitingForServerClose:Boolean = false;
 		private var closeTimeout:int = 5000;
 		private var closeTimer:Timer;
@@ -142,6 +147,7 @@ package com.worlize.websocket
 			currentFrame = new WebSocketFrame();
 
 			fatalError = false;
+			_deflateEnabled = false;
 			
 			closeTimer = new Timer(closeTimeout, 1);
 			closeTimer.addEventListener(TimerEvent.TIMER, handleCloseTimer);
@@ -277,7 +283,39 @@ package com.worlize.websocket
 		}
 		
 		public function get extensions():Array {
+			if (_deflateEnabled) {
+				return ["permessage-deflate"];
+			}
 			return [];
+		}
+		
+		/**
+		 * Enable or disable permessage-deflate negotiation.
+		 * Must be set before calling connect().
+		 * Default: true
+		 */
+		public function set enablePerMessageDeflate(val:Boolean):void {
+			_enablePerMessageDeflate = val;
+		}
+		public function get enablePerMessageDeflate():Boolean {
+			return _enablePerMessageDeflate;
+		}
+		
+		/**
+		 * Minimum payload size (in bytes) to trigger compression.
+		 * Messages smaller than this are sent uncompressed.
+		 * Default: 1024
+		 */
+		public function set deflateThreshold(val:uint):void {
+			_deflateThreshold = val;
+		}
+		public function get deflateThreshold():uint {
+			return _deflateThreshold;
+		}
+		
+		/** Returns true if permessage-deflate was successfully negotiated. */
+		public function get deflateEnabled():Boolean {
+			return _deflateEnabled;
 		}
 		
 		public function get host():String {
@@ -360,6 +398,29 @@ package com.worlize.websocket
 				throw new WebSocketError("You cannot fragment control frames.");
 			}
 			
+			// --- permessage-deflate: compress the full message payload
+			// before any fragmentation (RFC 7692 §6.1).
+			var deflateApplied:Boolean = false;
+			if (_deflateEnabled && frame.binaryPayload &&
+				frame.binaryPayload.length >= _deflateThreshold &&
+				(frame.opcode === WebSocketOpcode.TEXT_FRAME ||
+				 frame.opcode === WebSocketOpcode.BINARY_FRAME))
+			{
+				try {
+					var compressed:ByteArray = WebSocketDeflate.compress(frame.binaryPayload);
+					if (debug) {
+						logger("[WS] deflate: " + frame.binaryPayload.length + " -> " + compressed.length + " bytes");
+					}
+					frame.binaryPayload = compressed;
+					deflateApplied = true;
+				} catch (e:Error) {
+					// Compression failed — send uncompressed
+					if (debug) {
+						logger("[WS] deflate compress failed: " + e.message);
+					}
+				}
+			}
+			
 			var threshold:uint = config.fragmentationThreshold;
 						
 			if (config.fragmentOutgoingMessages && frame.binaryPayload && frame.binaryPayload.length > threshold) {
@@ -371,6 +432,11 @@ package com.worlize.websocket
 					
 					// continuation opcode except for first frame.
 					currentFrame.opcode = (i === 1) ? frame.opcode : 0x00;
+					
+					// RSV1 set on first frame only when deflate was applied (RFC 7692 §6.1)
+					if (deflateApplied && i === 1) {
+						currentFrame.rsv1 = true;
+					}
 					
 					// fin set on last frame only
 					currentFrame.fin = (i === numFragments);
@@ -388,6 +454,9 @@ package com.worlize.websocket
 			}
 			else {
 				frame.fin = true;
+				if (deflateApplied) {
+					frame.rsv1 = true;
+				}
 				sendFrame(frame);
 			}
 		}
@@ -506,21 +575,52 @@ package com.worlize.websocket
 			var i:int;
 			var currentFrame:WebSocketFrame;
 			
-			if (frame.rsv1 || frame.rsv2 || frame.rsv3) {
+			// RSV2 and RSV3 are always illegal (no extensions use them)
+			if (frame.rsv2 || frame.rsv3) {
 				drop(WebSocketCloseStatus.PROTOCOL_ERROR,
-					 "Received frame with reserved bit set without a negotiated extension.");
+					 "Received frame with reserved bit RSV2/RSV3 set without a negotiated extension.");
+				return;
+			}
+			// RSV1 is only legal when permessage-deflate is negotiated
+			if (frame.rsv1 && !_deflateEnabled) {
+				drop(WebSocketCloseStatus.PROTOCOL_ERROR,
+					 "Received frame with RSV1 set but permessage-deflate is not negotiated.");
 				return;
 			}
 
+			// --- permessage-deflate: track whether this message is compressed.
+			// RSV1 on the first frame of a data message means the payload is
+			// DEFLATE-compressed (RFC 7692 §6.2). Continuation frames carry
+			// RSV1=0 even if the message is compressed.
+			var messageCompressed:Boolean = false;
+			if (_deflateEnabled && frame.rsv1 &&
+				(frame.opcode === WebSocketOpcode.TEXT_FRAME ||
+				 frame.opcode === WebSocketOpcode.BINARY_FRAME))
+			{
+				messageCompressed = true;
+			}
+			
 			switch (frame.opcode) {
 				case WebSocketOpcode.BINARY_FRAME:
 					if (config.assembleFragments) {
 						if (frameQueue.length === 0) {
 							if (frame.fin) {
+								var binData:ByteArray = frame.binaryPayload;
+								if (messageCompressed) {
+									try {
+										binData = WebSocketDeflate.decompress(binData);
+										if (debug) {
+											logger("[WS] inflate: " + frame.binaryPayload.length + " -> " + binData.length + " bytes");
+										}
+									} catch (e:Error) {
+										drop(WebSocketCloseStatus.PROTOCOL_ERROR, "Failed to decompress BINARY frame: " + e.message);
+										return;
+									}
+								}
 								event = new WebSocketEvent(WebSocketEvent.MESSAGE);
 								event.message = new WebSocketMessage();
 								event.message.type = WebSocketMessage.TYPE_BINARY;
-								event.message.binaryData = frame.binaryPayload;
+								event.message.binaryData = binData;
 								dispatchEvent(event);
 							}
 							else if (frameQueue.length === 0) {
@@ -540,7 +640,20 @@ package com.worlize.websocket
 					if (config.assembleFragments) {
 						if (frameQueue.length === 0) {
 							if (frame.fin) {
-								var textData:String = frame.binaryPayload.readMultiByte(frame.length, 'utf-8');
+								var textPayload:ByteArray = frame.binaryPayload;
+								if (messageCompressed) {
+									try {
+										textPayload = WebSocketDeflate.decompress(textPayload);
+										if (debug) {
+											logger("[WS] inflate: " + frame.binaryPayload.length + " -> " + textPayload.length + " bytes");
+										}
+									} catch (e:Error) {
+										drop(WebSocketCloseStatus.PROTOCOL_ERROR, "Failed to decompress TEXT frame: " + e.message);
+										return;
+									}
+								}
+								textPayload.position = 0;
+								var textData:String = textPayload.readMultiByte(textPayload.length, 'utf-8');
 								logger("[WS] TEXT msg (" + textData.length + " chars): " + textData.substr(0, 80));
 								event = new WebSocketEvent(WebSocketEvent.MESSAGE);
 								event.message = new WebSocketMessage();
@@ -587,6 +700,8 @@ package com.worlize.websocket
 							event = new WebSocketEvent(WebSocketEvent.MESSAGE);
 							event.message = new WebSocketMessage();
 							var messageOpcode:int = frameQueue[0].opcode;
+							// Check if the first frame of this fragmented message had RSV1
+							var fragCompressed:Boolean = _deflateEnabled && frameQueue[0].rsv1;
 							var binaryData:ByteArray = new ByteArray();
 							var totalLength:int = 0;
 							for (i=0; i < frameQueue.length; i++) {
@@ -609,6 +724,19 @@ package com.worlize.websocket
 								currentFrame.binaryPayload.clear();
 							}
 							binaryData.position = 0;
+							// Decompress reassembled payload if compressed
+							if (fragCompressed) {
+								try {
+									var inflatedData:ByteArray = WebSocketDeflate.decompress(binaryData);
+									if (debug) {
+										logger("[WS] inflate fragmented: " + binaryData.length + " -> " + inflatedData.length + " bytes");
+									}
+									binaryData = inflatedData;
+								} catch (e:Error) {
+									drop(WebSocketCloseStatus.PROTOCOL_ERROR, "Failed to decompress fragmented message: " + e.message);
+									return;
+								}
+							}
 							switch (messageOpcode) {
 								case WebSocketOpcode.BINARY_FRAME:
 									event.message.type = WebSocketMessage.TYPE_BINARY;
@@ -714,7 +842,9 @@ package com.worlize.websocket
 				var protosList:String = _protocols.join(", ");
 				text += "Sec-WebSocket-Protocol: " + protosList + "\r\n";
 			}
-			// TODO: Handle Extensions
+			if (_enablePerMessageDeflate) {
+				text += "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n";
+			}
 			text += "\r\n";
 			
 			logger("[WS] Sending HTTP upgrade: " + text.substr(0, 120));
@@ -865,6 +995,21 @@ package com.worlize.websocket
 					else if (lcName === 'sec-websocket-extensions' && header.value) {
 						var extensionsThisLine:Array = header.value.split(',');
 						serverExtensions = serverExtensions.concat(extensionsThisLine);
+						// Check for permessage-deflate acceptance
+						for (var ei:int = 0; ei < extensionsThisLine.length; ei++) {
+							var deflateParams:Object = WebSocketDeflate.parseExtensionParams(extensionsThisLine[ei]);
+							if (deflateParams !== null) {
+								_deflateEnabled = true;
+								if (debug) {
+									logger("[WS] permessage-deflate negotiated" +
+										" server_no_context_takeover=" + deflateParams.serverNoContextTakeover +
+										" client_no_context_takeover=" + deflateParams.clientNoContextTakeover +
+										" server_max_window_bits=" + deflateParams.serverMaxWindowBits +
+										" client_max_window_bits=" + deflateParams.clientMaxWindowBits);
+								}
+								break;
+							}
+						}
 					}
 					else if (lcName === 'sec-websocket-accept') {
 						var byteArray:ByteArray = new ByteArray();
