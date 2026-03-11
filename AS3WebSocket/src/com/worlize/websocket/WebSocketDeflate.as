@@ -41,24 +41,6 @@ package com.worlize.websocket
 			var buf:ByteArray = new ByteArray();
 			buf.writeBytes(data, 0, data.length);
 			buf.compress(CompressionAlgorithm.DEFLATE);
-
-			// Strip the trailing 0x00 0x00 0xFF 0xFF if present
-			var len:uint = buf.length;
-			if (len >= 4) {
-				buf.position = len - 4;
-				if (buf.readUnsignedByte() === TAIL_0 &&
-					buf.readUnsignedByte() === TAIL_1 &&
-					buf.readUnsignedByte() === TAIL_2 &&
-					buf.readUnsignedByte() === TAIL_3)
-				{
-					// Truncate the last 4 bytes
-					var trimmed:ByteArray = new ByteArray();
-					trimmed.writeBytes(buf, 0, len - 4);
-					trimmed.position = 0;
-					return trimmed;
-				}
-			}
-
 			buf.position = 0;
 			return buf;
 		}
@@ -75,11 +57,20 @@ package com.worlize.websocket
 		public static function decompress(data:ByteArray):ByteArray {
 			var buf:ByteArray = new ByteArray();
 			buf.writeBytes(data, 0, data.length);
-			// Append the sync flush marker
+			
+			// 1. Reconstruct the Z_SYNC_FLUSH block per RFC 7692 §7.2.2
 			buf.writeByte(TAIL_0);
 			buf.writeByte(TAIL_1);
 			buf.writeByte(TAIL_2);
 			buf.writeByte(TAIL_3);
+			
+			// 2. Append an empty BFINAL=1 block to satisfy AS3's uncompress EOF requirement
+			// 0x01: BFINAL=1, BTYPE=00, padded to byte boundary. Followed by LEN(0) and NLEN(0xFFFF)
+			buf.writeByte(0x01);
+			buf.writeByte(0x00);
+			buf.writeByte(0x00);
+			buf.writeByte(0xFF);
+			buf.writeByte(0xFF);
 
 			buf.uncompress(CompressionAlgorithm.DEFLATE);
 			buf.position = 0;
